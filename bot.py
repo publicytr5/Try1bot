@@ -751,7 +751,7 @@ async def deposit_amount_selected(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     context.user_data['deposit_amount'] = amount
     text = (
-        f"🏦 DEPOSIT {amount:.0f}\n\n"
+        f"🏦 DEPOSIT ${amount:.0f}\n\n"
         "🪙 Choose payment coin:\n\n"
         "  🪙 LTC  — Litecoin\n"
         "  🟣  SOL  — Solana\n"
@@ -803,7 +803,7 @@ async def handle_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['deposit_amount'] = amount
 
     text = (
-        f"🏦 DEPOSIT {amount:.0f}\n\n"
+        f"🏦 DEPOSIT ${amount:.0f}\n\n"
         "🪙 Choose payment coin:\n\n"
         "  🪙 LTC  — Litecoin\n"
         "  🟣  SOL  — Solana\n"
