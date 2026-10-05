@@ -96,20 +96,84 @@ COIN_META = {
 }
 
 
-def fetch_crypto_rate_usd_sync(coin_symbol: str) -> float:
-    """CoinGecko থেকে লাইভ USD রেট আনে, ব্যর্থ হলে fallback দেয়।"""
-    meta = COIN_META.get(coin_symbol.upper())
-    if not meta:
-        return 0.0
+# =========================================================
+#  RATE FETCH (CoinGecko → Binance → Coinbase) + 10-min Cache
+# =========================================================
+RATE_CACHE: Dict[str, Dict] = {}
+RATE_CACHE_MINUTES = 10
+
+
+def _fetch_live_rate(coin: str, meta: dict) -> Optional[float]:
+    # 1) CoinGecko
     try:
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={meta['cg_id']}&vs_currencies=usd"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode())
-            return float(data[meta["cg_id"]]["usd"])
+            val = float(data[meta["cg_id"]]["usd"])
+            if val > 0:
+                logger.info(f"CoinGecko {coin}: ${val:.2f}")
+                return val
     except Exception as e:
-        logger.error(f"Rate fetch failed for {coin_symbol}: {e}")
-        return float(meta["fallback"])
+        logger.warning(f"CoinGecko failed for {coin}: {e}")
+
+    # 2) Binance
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={coin}USDT"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+            val = float(data["price"])
+            if val > 0:
+                logger.info(f"Binance {coin}: ${val:.2f}")
+                return val
+    except Exception as e:
+        logger.warning(f"Binance failed for {coin}: {e}")
+
+    # 3) Coinbase
+    try:
+        url = f"https://api.coinbase.com/v2/prices/{coin}-USD/spot"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+            val = float(data["data"]["amount"])
+            if val > 0:
+                logger.info(f"Coinbase {coin}: ${val:.2f}")
+                return val
+    except Exception as e:
+        logger.warning(f"Coinbase failed for {coin}: {e}")
+
+    return None
+
+
+def fetch_crypto_rate_usd_sync(coin_symbol: str) -> float:
+    coin = coin_symbol.upper()
+    meta = COIN_META.get(coin)
+    if not meta:
+        return 0.0
+
+    now = datetime.now(timezone.utc)
+    cached = RATE_CACHE.get(coin)
+    stale_rate = None
+
+    if cached:
+        age_min = (now - cached["timestamp"]).total_seconds() / 60
+        if age_min < RATE_CACHE_MINUTES:
+            logger.info(f"Using cached {coin} rate: ${cached['rate']:.2f} (age {age_min:.1f}m)")
+            return cached["rate"]
+        stale_rate = cached["rate"]
+
+    rate = _fetch_live_rate(coin, meta)
+    if rate and rate > 0:
+        RATE_CACHE[coin] = {"rate": rate, "timestamp": now}
+        return rate
+
+    if stale_rate:
+        logger.warning(f"Using stale cache for {coin}: ${stale_rate:.2f}")
+        return stale_rate
+
+    logger.warning(f"Using hardcoded fallback for {coin}: ${meta['fallback']:.2f}")
+    return float(meta["fallback"])
 
 
 # =========================================================
@@ -765,10 +829,11 @@ async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TY
     meta = COIN_META[coin]
     address = random.choice(meta["addresses"])
 
-    # লাইভ রেট
+    # লাইভ রেট (১০ মিনিট ক্যাশ)
     try:
         rate = await asyncio.to_thread(fetch_crypto_rate_usd_sync, coin)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Rate fetch exception: {e}")
         rate = float(meta["fallback"])
     if rate <= 0:
         rate = float(meta["fallback"])
@@ -787,69 +852,71 @@ async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TY
     qr.save(qr_bytes, format='PNG')
     qr_bytes.seek(0)
 
-    # ---------- ১) QR ছবি (শুধু ছোট caption) ----------
-    try:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=qr_bytes,
-            caption=f"📸 Scan the QR code to pay\n🏦 {coin} Address:\n`{address}`",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"QR send failed: {e}")
-
-    # ---------- ২) বিস্তারিত invoice আলাদা text message ----------
-    invoice_text = (
-        "Here are the details:\n"
-        f"Send *{coin}* to the address shown below:\n\n"
-        "📸 Scan the QR code or copy the address to proceed with payment.\n\n"
+    # ---------- সংক্ষিপ্ত caption (QR এর সাথে) ----------
+    caption = (
+        f"📸 Scan QR or copy address to pay.\n\n"
         f"🏦 *{coin}* Address: `{address}`\n"
-        f"💎 Currency : {coin}\n"
-        f"Deposit Amount : $ {amount:.2f}\n"
-        f"Rate used: 1 {coin} ≈ ${rate:.2f}\n"
+        f"💎 Currency: {coin}\n"
+        f"💰 Amount: ${amount:.2f}\n"
+        f"📊 Rate: 1 {coin} ≈ ${rate:,.2f}\n"
         f"💸 Send Exactly: `{send_amount:.8f} {coin}`\n\n"
         f"⚠️ Only send *{coin}* assets to this address. Other assets will be lost forever.\n"
-        f"Charge ID: `{user.user_id}`\n"
-        f"Valid till: `{valid_till_str}`\n"
-        "More details:\n"
-        f"Payment ID: `{user.user_id}`\n"
-        f"Order number: `{order_number}`\n\n"
-        "1. Make sure you deposit the exact value to get the funds. If the value is lower than the invoice value, your funds may not be deposited.\n"
-        f"Any issue, contact @{CONTACT_USERNAME} with your charge ID.\n"
-        "2. Do not deposit two times to this same address. Only deposit once.\n"
-        "3. Deposit to this address within 30 Minuets. After 30 Minuets this address is not valid anymore. You will need to create a new deposit by typing /deposit.\n"
-        "4. If you sent money and are waiting for confirmations, do not create another invoice. Wait for the money to get confirmed.\n"
-        "5. Your balance will be automatically credited to your account within 2 minutes of your deposit."
+        f"🆔 Charge ID: `{user.user_id}`\n"
+        f"⏰ Valid till: `{valid_till_str}`\n"
+        f"📋 Payment ID: `{user.user_id}`\n"
+        f"🔢 Order number: `{order_number}`\n\n"
+        f"1. Deposit exact value or funds may not be credited.\n"
+        f"Any issue → @{CONTACT_USERNAME} (include Charge ID)\n"
+        f"2. Do not deposit twice to this address.\n"
+        f"3. Valid 30 min. Then create new invoice via /deposit.\n"
+        f"4. If waiting for confirmations, do not create new invoice.\n"
+        f"5. Balance credits within 2 min after deposit."
     )
+
     reply_markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("✆Contract", url=f"https://t.me/{CONTACT_USERNAME}")
     ]])
 
+    # ---------- QR + Invoice এক মেসেজে ----------
     sent_invoice = None
     try:
-        sent_invoice = await context.bot.send_message(
+        sent_invoice = await context.bot.send_photo(
             chat_id=chat_id,
-            text=invoice_text,
+            photo=qr_bytes,
+            caption=caption,
             parse_mode='Markdown',
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
+            reply_markup=reply_markup
         )
     except Exception as e:
-        logger.error(f"Markdown invoice failed, trying plain text: {e}")
+        logger.error(f"Combined QR+caption failed: {e} — trying plain text caption")
         try:
-            sent_invoice = await context.bot.send_message(
+            qr_bytes.seek(0)
+            sent_invoice = await context.bot.send_photo(
                 chat_id=chat_id,
-                text=invoice_text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
+                photo=qr_bytes,
+                caption=caption,
+                reply_markup=reply_markup
             )
         except Exception as e2:
-            logger.error(f"Plain invoice also failed: {e2}")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="⚠️ Failed to send invoice. Try /deposit again."
-            )
-            return
+            logger.error(f"Plain caption also failed: {e2} — splitting")
+            try:
+                await context.bot.send_photo(chat_id=chat_id, photo=qr_bytes)
+            except Exception as e3:
+                logger.error(f"QR alone failed too: {e3}")
+            try:
+                sent_invoice = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=caption,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+            except Exception as e4:
+                logger.error(f"Text alone failed too: {e4}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Failed to send invoice. Try /deposit again."
+                )
+                return
 
     # কয়েন-সিলেক্ট মেসেজ ডিলিট
     try:
@@ -859,7 +926,7 @@ async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TY
 
     context.user_data.pop('deposit_amount', None)
 
-    # ৩১ মিনিট পর মেসেজ ডিলিট + expiry message
+    # ৩১ মিনিট পর মেসেজ ডিলিট + expiry মেসেজ
     job_queue = context.application.job_queue
     if job_queue and sent_invoice:
         job_queue.run_once(
