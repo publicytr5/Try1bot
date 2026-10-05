@@ -387,7 +387,7 @@ class KeyboardBuilder:
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("💳 Stock", callback_data="stock"),
-                InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/Vanila_card_prepaid")
+                InlineKeyboardButton("📞 Contact Admin", url="https://t.me/Vanila_card_prepaid")
             ],
             [
                 InlineKeyboardButton("Card chaker 🔍", url="https://t.me/Botcardchakerbot"),
@@ -554,7 +554,10 @@ async def send_listing_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     ])
     reply_markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
-        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup)
+        try:
+            await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"edit_message_text failed: {e}")
     else:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
 
@@ -581,7 +584,7 @@ async def send_stock_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_balance = sum(c.amount for c in cards)
     message_text += f"\nTotal Cards: {len(cards)} | Total Cards Balance: ${total_balance:.2f}\n"
     message_text += "Legend:\n🔄 = Re-listed\n🅶 = Used on Google\n🅿 = Used on PayPal\n\n"
-    message_text += f"Filters: None \n"
+    message_text += "Filters: None \n"
     message_text += f"Page: 1/{total_pages} | Updated: {datetime.now().strftime('%H:%M:%S')}"
     keyboard = []
     for i, card in enumerate(cards, 1):
@@ -610,12 +613,8 @@ async def send_stock_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-#  BALANCE / WITHDRAW / DEPOSIT  (NEW FLOW)
+#  BALANCE / WITHDRAW / DEPOSIT
 # =========================================================
-def utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = user_manager.get_or_create_user(update)
     last_update = datetime.now(timezone.utc) - timedelta(minutes=2)
@@ -694,18 +693,30 @@ async def deposit_amount_selected(update: Update, context: ContextTypes.DEFAULT_
         "  🟣  SOL  — Solana\n"
         "   ₿  BTC  — Bitcoin"
     )
-    await query.edit_message_text(text, reply_markup=keyboard_builder.get_coin_keyboard())
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard_builder.get_coin_keyboard())
+    except Exception as e:
+        logger.error(f"coin menu edit failed: {e}")
+        await query.message.reply_text(text, reply_markup=keyboard_builder.get_coin_keyboard())
 
 
 async def deposit_custom_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_custom_amount'] = True
-    await query.edit_message_text(
-        "✏️ Custom Deposit Amount\n\n"
-        "Enter amount in USD (Minimum $15)\n\n"
-        "Then choose your coin — address generates instantly."
-    )
+    try:
+        await query.edit_message_text(
+            "✏️ Custom Deposit Amount\n\n"
+            "Enter amount in USD (Minimum $15)\n\n"
+            "Then choose your coin — address generates instantly."
+        )
+    except Exception as e:
+        logger.error(f"custom start edit failed: {e}")
+        await query.message.reply_text(
+            "✏️ Custom Deposit Amount\n\n"
+            "Enter amount in USD (Minimum $15)\n\n"
+            "Then choose your coin — address generates instantly."
+        )
 
 
 async def handle_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -741,7 +752,7 @@ async def handle_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYP
 async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    coin = query.data.split("_")[-1]           # BTC / SOL / LTC
+    coin = query.data.split("_")[-1]
     if coin not in COIN_META:
         await query.edit_message_text("❌ Unknown coin. Please try again with /deposit")
         return
@@ -754,7 +765,7 @@ async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TY
     meta = COIN_META[coin]
     address = random.choice(meta["addresses"])
 
-    # লাইভ রেট আনা (sync ফাংশনকে thread এ চালানো)
+    # লাইভ রেট
     try:
         rate = await asyncio.to_thread(fetch_crypto_rate_usd_sync, coin)
     except Exception:
@@ -768,13 +779,27 @@ async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TY
     valid_till = datetime.now(timezone.utc) + timedelta(minutes=30)
     valid_till_str = valid_till.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # QR তৈরি
+    chat_id = update.effective_chat.id
+
+    # ---------- QR তৈরি ----------
     qr = qrcode.make(address)
     qr_bytes = BytesIO()
     qr.save(qr_bytes, format='PNG')
     qr_bytes.seek(0)
 
-    caption = (
+    # ---------- ১) QR ছবি (শুধু ছোট caption) ----------
+    try:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=qr_bytes,
+            caption=f"📸 Scan the QR code to pay\n🏦 {coin} Address:\n`{address}`",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"QR send failed: {e}")
+
+    # ---------- ২) বিস্তারিত invoice আলাদা text message ----------
+    invoice_text = (
         "Here are the details:\n"
         f"Send *{coin}* to the address shown below:\n\n"
         "📸 Scan the QR code or copy the address to proceed with payment.\n\n"
@@ -800,33 +825,43 @@ async def deposit_coin_selected(update: Update, context: ContextTypes.DEFAULT_TY
         InlineKeyboardButton("✆Contract", url=f"https://t.me/{CONTACT_USERNAME}")
     ]])
 
-    chat_id = update.effective_chat.id
+    sent_invoice = None
+    try:
+        sent_invoice = await context.bot.send_message(
+            chat_id=chat_id,
+            text=invoice_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Markdown invoice failed, trying plain text: {e}")
+        try:
+            sent_invoice = await context.bot.send_message(
+                chat_id=chat_id,
+                text=invoice_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+        except Exception as e2:
+            logger.error(f"Plain invoice also failed: {e2}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Failed to send invoice. Try /deposit again."
+            )
+            return
 
-    # আগের কয়েন-সিলেক্ট মেসেজ ডিলিট করার চেষ্টা
+    # কয়েন-সিলেক্ট মেসেজ ডিলিট
     try:
         await query.message.delete()
     except Exception as e:
         logger.error(f"Could not delete coin-select msg: {e}")
 
-    # ইনভয়েস QR সহ পাঠানো
-    try:
-        sent_invoice = await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=qr_bytes,
-            caption=caption,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        logger.error(f"Failed to send invoice: {e}")
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ Failed to send invoice. Try /deposit again.")
-        return
-
     context.user_data.pop('deposit_amount', None)
 
-    # ৩১ মিনিট পর মেসেজ ডিলিট করে এক্সপায়ার মেসেজ পাঠানো
+    # ৩১ মিনিট পর মেসেজ ডিলিট + expiry message
     job_queue = context.application.job_queue
-    if job_queue:
+    if job_queue and sent_invoice:
         job_queue.run_once(
             deposit_expired_job,
             when=31 * 60,
@@ -1059,7 +1094,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cards, total_pages = card_generator.get_cards_paginated(page, filter_type=filter_type)
         await send_listing_page(update, context, cards, page, total_pages, filter_type)
     elif data == "show_filters":
-        await query.edit_message_reply_markup(reply_markup=keyboard_builder.get_filters_keyboard())
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard_builder.get_filters_keyboard())
+        except Exception as e:
+            logger.error(f"show_filters failed: {e}")
     elif data.startswith("filter_"):
         filter_type = data.replace("filter_", "")
         cards, total_pages = card_generator.get_cards_paginated(1, filter_type=filter_type)
@@ -1071,7 +1109,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- MESSAGE HANDLER ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # কাস্টম ডিপোজিট এমাউন্ট হ্যান্ডেল
     if context.user_data.get('awaiting_custom_amount'):
         handled = await handle_custom_amount(update, context)
         if handled:
